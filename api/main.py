@@ -52,6 +52,7 @@ class AgentState(TypedDict):
     messages: Annotated[List, operator.add]
     context: str
     question: str
+    route: str
 
 
 embedding_model = GoogleGenerativeAIEmbeddings(
@@ -71,16 +72,55 @@ llm = ChatGoogleGenerativeAI(
 )
 
 
+RAG_KEYWORDS = [
+    # Conceptos generales de ML
+    "machine learning", "aprendizaje automático", "aprendizaje supervisado", "no supervisado",
+    "reinforcement learning", "refuerzo", "clasificación", "regresión", "clustering",
+    "agrupamiento", "overfitting", "underfitting", "sesgo", "varianza", "bias", "variance",
+    "precisión", "accuracy", "recall", "exhaustividad", "f1", "matriz de confusión",
+    "curva roc", "auc", "cross-validation", "validación cruzada", "hiperparámetro",
+    "feature", "característica", "preprocesamiento", "normalización", "estandarización",
+    # Algoritmos y modelos
+    "regresión lineal", "linear regression", "logistic", "logística", "svm", "máquina de vectores",
+    "support vector", "árbol", "decision tree", "random forest", "gradient boosting", "xgboost",
+    "k-means", "kmeans", "k nearest", "knn", "naive bayes", "perceptrón", "red neuronal",
+    "neural network", "deep learning", "cnn", "rnn", "transformer", "autoencoder", "gan",
+    # Scikit-Learn / Keras / TensorFlow
+    "scikit-learn", "sklearn", "tensorflow", "keras", "tf", "pipeline", "estimator",
+    "fit", "predict", "modelo", "entrenamiento", "epochs", "batch", "optimizer",
+    "loss", "metric", "callback", "early stopping", "dropout", "regularización",
+    "l1", "l2", "batch normalization", "data augmentation", "transfer learning",
+    # Libro / capítulos
+    "libro", "capítulo", "chapter", "página", "page", "aurélien", "geron",
+]
+
+
+def route(state: AgentState) -> dict:
+    """Decide si es necesario recuperar contexto del libro."""
+    question = state["question"].lower()
+    needs_rag = any(keyword in question for keyword in RAG_KEYWORDS)
+    return {"route": "RAG" if needs_rag else "DIRECTO"}
+
+
 def retrieve(state: AgentState) -> dict:
     docs = retriever.invoke(state["question"])
     return {"context": "\n\n".join(d.page_content for d in docs)}
 
 
 def generate(state: AgentState) -> dict:
-    system_content = SYSTEM_PROMPT.format(context=state["context"])
+    if state.get("route") == "DIRECTO":
+        system_content = (
+            "Eres un asistente amable experto en Machine Learning. "
+            "Responde la pregunta del usuario de forma breve y cordial. "
+            "Si el usuario pregunta sobre ML, invítalo a consultar el libro."
+        )
+    else:
+        system_content = SYSTEM_PROMPT.format(context=state["context"])
+
     prompt_messages = [SystemMessage(content=system_content)]
     prompt_messages.extend(state.get("messages", []))
     prompt_messages.append(HumanMessage(content=state["question"]))
+
     response = llm.invoke(prompt_messages)
     return {
         "messages": [
@@ -91,9 +131,16 @@ def generate(state: AgentState) -> dict:
 
 
 workflow = StateGraph(AgentState)
+workflow.add_node("route", route)
 workflow.add_node("retrieve", retrieve)
 workflow.add_node("generate", generate)
-workflow.set_entry_point("retrieve")
+
+workflow.set_entry_point("route")
+workflow.add_conditional_edges(
+    "route",
+    lambda state: state["route"],
+    {"RAG": "retrieve", "DIRECTO": "generate"},
+)
 workflow.add_edge("retrieve", "generate")
 workflow.add_edge("generate", END)
 agent = workflow.compile()
