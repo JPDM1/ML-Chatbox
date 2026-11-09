@@ -1,31 +1,30 @@
+import operator
 import os
-import sys
 from pathlib import Path
-from typing import Annotated, List
+from typing import Annotated, List, TypedDict
 
+import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from langchain_chroma import Chroma
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langgraph.graph import END, StateGraph
 from pydantic import BaseModel
 
-# ── resolve paths relative to this file ──────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(BASE_DIR))
-
 load_dotenv(BASE_DIR / ".env")
 
-import operator
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from langchain_chroma import Chroma
-from langgraph.graph import StateGraph, END
-from typing import TypedDict
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY no está definida. Configúrala en el archivo .env")
 
-# ── Config ────────────────────────────────────────────────────────────────────
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 MODEL_NAME = "gemini-2.5-flash-lite"
 EMBEDDING_MODEL = "models/gemini-embedding-001"
 CHROMA_DIR = str(BASE_DIR / "chroma_ml_book")
+COLLECTION_NAME = "ml_book"
+RETRIEVER_K = 5
 
 SYSTEM_PROMPT = """Eres un agente experto en Machine Learning con Scikit-Learn y TensorFlow, basado en el libro "Hands-On Machine Learning with Scikit-Learn, Keras & TensorFlow" de Aurélien Géron.
 Tu base de conocimiento contiene el contenido completo del libro: algoritmos de ML clásico, redes neuronales, deep learning, técnicas de preprocesamiento, evaluación de modelos y buenas prácticas.
@@ -47,30 +46,36 @@ Comportamiento cuando no hay información suficiente:
 Contexto recuperado del vector store:
 {context}"""
 
-# ── LangGraph agent ───────────────────────────────────────────────────────────
+DIRECT_PROMPT = (
+    "Eres un asistente amable experto en Machine Learning. "
+    "Responde la pregunta del usuario de forma breve y cordial. "
+    "Si el usuario pregunta sobre ML, invítalo a consultar el libro."
+)
+
+
 class AgentState(TypedDict):
-    messages: Annotated[List, operator.add]
+    messages: Annotated[List[BaseMessage], operator.add]
     context: str
     question: str
     route: str
 
 
 embedding_model = GoogleGenerativeAIEmbeddings(
-    model=EMBEDDING_MODEL, google_api_key=GEMINI_API_KEY
+    model=EMBEDDING_MODEL,
+    google_api_key=GEMINI_API_KEY,
 )
 vectorstore = Chroma(
     persist_directory=CHROMA_DIR,
     embedding_function=embedding_model,
-    collection_name="ml_book",
+    collection_name=COLLECTION_NAME,
 )
-retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+retriever = vectorstore.as_retriever(search_kwargs={"k": RETRIEVER_K})
 
 llm = ChatGoogleGenerativeAI(
     model=MODEL_NAME,
     google_api_key=GEMINI_API_KEY,
     temperature=0.2,
 )
-
 
 RAG_KEYWORDS = [
     # Conceptos generales de ML
@@ -104,18 +109,15 @@ def route(state: AgentState) -> dict:
 
 def retrieve(state: AgentState) -> dict:
     docs = retriever.invoke(state["question"])
-    return {"context": "\n\n".join(d.page_content for d in docs)}
+    return {"context": "\n\n".join(doc.page_content for doc in docs)}
 
 
 def generate(state: AgentState) -> dict:
-    if state.get("route") == "DIRECTO":
-        system_content = (
-            "Eres un asistente amable experto en Machine Learning. "
-            "Responde la pregunta del usuario de forma breve y cordial. "
-            "Si el usuario pregunta sobre ML, invítalo a consultar el libro."
-        )
-    else:
-        system_content = SYSTEM_PROMPT.format(context=state["context"])
+    system_content = (
+        DIRECT_PROMPT
+        if state.get("route") == "DIRECTO"
+        else SYSTEM_PROMPT.format(context=state["context"])
+    )
 
     prompt_messages = [SystemMessage(content=system_content)]
     prompt_messages.extend(state.get("messages", []))
@@ -130,27 +132,28 @@ def generate(state: AgentState) -> dict:
     }
 
 
-workflow = StateGraph(AgentState)
-workflow.add_node("route", route)
-workflow.add_node("retrieve", retrieve)
-workflow.add_node("generate", generate)
+def build_agent():
+    workflow = StateGraph(AgentState)
+    workflow.add_node("route", route)
+    workflow.add_node("retrieve", retrieve)
+    workflow.add_node("generate", generate)
 
-workflow.set_entry_point("route")
-workflow.add_conditional_edges(
-    "route",
-    lambda state: state["route"],
-    {"RAG": "retrieve", "DIRECTO": "generate"},
-)
-workflow.add_edge("retrieve", "generate")
-workflow.add_edge("generate", END)
-agent = workflow.compile()
+    workflow.set_entry_point("route")
+    workflow.add_conditional_edges(
+        "route",
+        lambda state: state["route"],
+        {"RAG": "retrieve", "DIRECTO": "generate"},
+    )
+    workflow.add_edge("retrieve", "generate")
+    workflow.add_edge("generate", END)
 
-# ── Session store (in-memory) ─────────────────────────────────────────────────
-sessions: dict[str, list] = {}
+    return workflow.compile()
 
-# ── FastAPI ───────────────────────────────────────────────────────────────────
+
+agent = build_agent()
+sessions: dict[str, List[BaseMessage]] = {}
+
 app = FastAPI(title="ML Book Chat API")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -177,11 +180,18 @@ class ResetRequest(BaseModel):
 def chat(req: ChatRequest):
     history = sessions.get(req.session_id, [])
     result = agent.invoke(
-        {"messages": history, "context": "", "question": req.message}
+        {
+            "messages": history,
+            "context": "",
+            "question": req.message,
+            "route": "",
+        }
     )
     sessions[req.session_id] = result["messages"]
-    answer = result["messages"][-1].content
-    return ChatResponse(answer=answer, session_id=req.session_id)
+    return ChatResponse(
+        answer=result["messages"][-1].content,
+        session_id=req.session_id,
+    )
 
 
 @app.post("/reset")
@@ -193,3 +203,7 @@ def reset(req: ResetRequest):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8000)
